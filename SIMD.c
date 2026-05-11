@@ -5,105 +5,66 @@
 #include <x86intrin.h>
 #include "bmp_utils.h"
 
-// void convolve_simd(const unsigned char* input, unsigned char* output, int width, int height, float kernel[3][3]) {
-//     int channels = 3;
-//     memcpy(output, input, width * height * channels);
-
-//     for (int y = 1; y < height - 1; y++) {
-//         int x_start = 1;
-//         int x_end = width - 1;
-//         int flat_start = (y * width + x_start) * channels;
-//         int flat_end = (y * width + x_end) * channels;
-
-//         int i;
-//         for (i = flat_start; i <= flat_end - 4; i += 4) {
-//             __m128 sum_vec = _mm_setzero_ps();
-
-//             for (int ky = -1; ky <= 1; ky++) {
-//                 for (int kx = -1; kx <= 1; kx++) {
-//                     int offset = (ky * width + kx) * channels;
-                    
-//                     int packed_chars = *(int*)&input[i + offset];
-//                     __m128i in_chars = _mm_cvtsi32_si128(packed_chars); 
-//                     __m128i in_ints = _mm_cvtepu8_epi32(in_chars);
-//                     __m128 in_floats = _mm_cvtepi32_ps(in_ints);
-
-//                     __m128 k_vec = _mm_set1_ps(kernel[ky+1][kx+1]);
-//                     sum_vec = _mm_add_ps(sum_vec, _mm_mul_ps(in_floats, k_vec));
-//                 }
-//             }
-
-//             __m128i out_ints = _mm_cvtps_epi32(sum_vec);
-//             __m128i packed16 = _mm_packs_epi32(out_ints, out_ints);
-//             __m128i packed8 = _mm_packus_epi16(packed16, packed16);
-//             *(int*)&output[i] = _mm_cvtsi128_si32(packed8);
-//         }
-
-//         for (; i < flat_end; i++) {
-//             float sum = 0;
-//             for (int ky = -1; ky <= 1; ky++) {
-//                 for (int kx = -1; kx <= 1; kx++) {
-//                     int offset = (ky * width + kx) * channels;
-//                     sum += input[i + offset] * kernel[ky+1][kx+1];
-//                 }
-//             }
-//             output[i] = clamp(sum);
-//         }
-//     }
-// }
-
-// Macro to handle the load and conversion from 8-bit unsigned char to 32-bit float
-// This avoids function call overhead and is standard-C compatible.
-#define LOAD_AND_CONVERT(ptr, offset) \
+// Macro to load 4 bytes (one pixel's worth of channels) and convert to 4 floats
+// This is pure C and replaces the previous C++ lambda error.
+#define LOAD_RGB_TO_FLOAT(ptr, offset) \
     _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_loadu_si128((__m128i*)((ptr) + (offset)))))
 
 void convolve_simd(const unsigned char* input, unsigned char* output, int width, int height, float kernel[3][3]) {
     const int channels = 3;
     const int row_stride = width * channels;
 
-    // --- TECHNIQUE: Register Blocking (SIMD) ---
-    // Broadcast kernel coefficients into 128-bit registers[cite: 57].
+    // --- TECHNIQUE: Register Blocking ---
+    // Broadcast kernel weights to SIMD registers. This is a key optimization 
+    // from Hager & Wellein to reduce memory traffic by keeping the stencil
+    // coefficients in CPU registers throughout the entire execution.
     __m128 k00 = _mm_set1_ps(kernel[0][0]); __m128 k01 = _mm_set1_ps(kernel[0][1]); __m128 k02 = _mm_set1_ps(kernel[0][2]);
     __m128 k10 = _mm_set1_ps(kernel[1][0]); __m128 k11 = _mm_set1_ps(kernel[1][1]); __m128 k12 = _mm_set1_ps(kernel[1][2]);
     __m128 k20 = _mm_set1_ps(kernel[2][0]); __m128 k21 = _mm_set1_ps(kernel[2][1]); __m128 k22 = _mm_set1_ps(kernel[2][2]);
 
     // =========================================================================
-    // PART 1: THE VECTORIZED CORE (Safe Inner Region)
+    // PART 1: THE CORE (Vectorized, Linear Access)
     // =========================================================================
-    // We process from y=1 to height-2 and x=1 to width-2 to avoid border checks.
+    // By processing y from 1 to height-1, we avoid boundary checks in the hot loop.
     for (int y = 1; y < height - 1; y++) {
-        for (int x = 1; x < width - 1; x++) { 
+        for (int x = 1; x < width - 1; x++) {
             int idx = (y * width + x) * channels;
 
-            const unsigned char* in_r0 = &input[idx - row_stride];
-            const unsigned char* in_r1 = &input[idx];
-            const unsigned char* in_r2 = &input[idx + row_stride];
+            // Row pointers for the 3x3 stencil
+            const unsigned char* r0 = &input[idx - row_stride];
+            const unsigned char* r1 = &input[idx];
+            const unsigned char* r2 = &input[idx + row_stride];
 
+            // --- TECHNIQUE: SIMD Vectorization ---
+            // We process R, G, and B simultaneously. 
+            // The 4th slot in the SIMD register is used for the R-channel 
+            // of the next pixel but is discarded during storage.
             __m128 sum = _mm_setzero_ps();
-            
-            // Apply 3x3 kernel using SIMD[cite: 58].
-            // Each LOAD_AND_CONVERT handles R, G, B, and a 4th dummy/next-R channel.
-            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_AND_CONVERT(in_r0, -3), k00));
-            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_AND_CONVERT(in_r0,  0), k01));
-            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_AND_CONVERT(in_r0,  3), k02));
 
-            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_AND_CONVERT(in_r1, -3), k10));
-            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_AND_CONVERT(in_r1,  0), k11));
-            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_AND_CONVERT(in_r1,  3), k12));
+            // Row 0
+            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_RGB_TO_FLOAT(r0, -3), k00));
+            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_RGB_TO_FLOAT(r0,  0), k01));
+            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_RGB_TO_FLOAT(r0,  3), k02));
 
-            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_AND_CONVERT(in_r2, -3), k20));
-            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_AND_CONVERT(in_r2,  0), k21));
-            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_AND_CONVERT(in_r2,  3), k22));
+            // Row 1
+            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_RGB_TO_FLOAT(r1, -3), k10));
+            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_RGB_TO_FLOAT(r1,  0), k11));
+            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_RGB_TO_FLOAT(r1,  3), k12));
+
+            // Row 2
+            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_RGB_TO_FLOAT(r2, -3), k20));
+            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_RGB_TO_FLOAT(r2,  0), k21));
+            sum = _mm_add_ps(sum, _mm_mul_ps(LOAD_RGB_TO_FLOAT(r2,  3), k22));
 
             // --- TECHNIQUE: SIMD Clamping ---
-            // Clamps all 4 channels in the register to [0.0, 255.0][cite: 41].
+            // Replaces conditional branches (if statements) with hardware max/min.
             sum = _mm_max_ps(sum, _mm_setzero_ps());
             sum = _mm_min_ps(sum, _mm_set1_ps(255.0f));
 
-            // Convert floats back to integers and extract the first 3 (RGB)
-            __m128i final_ints = _mm_cvtps_epi32(sum);
+            // Convert back to integers and store results
+            __m128i res_ints = _mm_cvtps_epi32(sum);
             unsigned int res[4];
-            _mm_storeu_si128((__m128i*)res, final_ints);
+            _mm_storeu_si128((__m128i*)res, res_ints);
 
             output[idx]     = (unsigned char)res[0];
             output[idx + 1] = (unsigned char)res[1];
@@ -112,13 +73,15 @@ void convolve_simd(const unsigned char* input, unsigned char* output, int width,
     }
 
     // =========================================================================
-    // PART 2: THE BOUNDARY (Loop Peeling for Zero-Padding)
+    // PART 2: THE BOUNDARY (Loop Peeling for Zero Padding)
     // =========================================================================
-    // This handles the edges separately to satisfy the zero-padding requirement[cite: 24, 63].
+    // Zero-padding treats pixels outside the image as 0. 
+    // We peel the 1-pixel border to a scalar loop so the SIMD core remains fast.
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
+            // If we are inside the core, skip to the end of the line.
             if (y >= 1 && y < height - 1 && x >= 1 && x < width - 1) {
-                x = width - 2; // Skip the inner core
+                x = width - 2;
                 continue;
             }
 
@@ -128,6 +91,7 @@ void convolve_simd(const unsigned char* input, unsigned char* output, int width,
                     int ny = y + ky;
                     int nx = x + kx;
 
+                    // Zero-padding logic: Check if neighbor is valid
                     if (ny >= 0 && ny < height && nx >= 0 && nx < width) {
                         int p_idx = (ny * width + nx) * channels;
                         float kv = kernel[ky + 1][kx + 1];
@@ -144,7 +108,6 @@ void convolve_simd(const unsigned char* input, unsigned char* output, int width,
         }
     }
 }
-
 int main(int argc, char* argv[]) {
     // Default to "output1.bmp" if no argument is provided
     const char* input_filename = (argc > 1) ? argv[1] : "output1.bmp";
