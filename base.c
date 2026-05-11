@@ -81,8 +81,15 @@ int main(int argc, char* argv[]) {
         convolve_baseline(input_img, output_img, info.width, info.height, kernel);
     }
     clock_t end = clock();
+
+    double time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+    double total_bytes = 2.0 * img_size * iterations;
+
+    double bandwidth_gbs = (total_bytes / 1000000000.0) / time_taken;
     
-    printf("Baseline Time: %f seconds\n", ((double)(end - start)) / CLOCKS_PER_SEC);
+    printf("Processed '%s' (%dx%d)\n", input_filename, info.width, info.height);
+    printf("Time Taken: %f seconds (over %d iterations)\n", time_taken, iterations);
+    printf("Effective Bandwidth: %.3f GB/s\n", bandwidth_gbs);
 
     FILE *f_out = fopen("out_baseline.bmp", "wb");
     fwrite(&header, sizeof(BMPHeader), 1, f_out);
